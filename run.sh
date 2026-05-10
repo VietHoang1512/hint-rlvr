@@ -6,10 +6,10 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=200GB
 #SBATCH --job-name=mint
-#SBATCH --output=/scratch/hvp2011/implement/rgpo/logs/%j.out
-#SBATCH --error=/scratch/hvp2011/implement/rgpo/logs/%j.err
-##SBATCH --account=torch_pr_40_tandon_advanced
-#SBATCH --account=torch_pr_559_cds
+#SBATCH --output=
+#SBATCH --error=
+##SBATCH --account=
+#SBATCH --account=
 
 module purge
 module load anaconda3/2025.06
@@ -23,26 +23,14 @@ nvidia-smi
 
 export HYDRA_FULL_ERROR=1 
 
-export HF_TOKEN=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
-export WANDB_API_KEY="8e206762de4253cfbf4fd8db344147e420be8b78"
+export HF_TOKEN=
+export WANDB_API_KEY=
 export HYDRA_FULL_ERROR=1 
 unset ROCR_VISIBLE_DEVICES
 
-# export RAY_TMPDIR=/scratch/hvp2011/implement/rgpo/outputs/ray_tmp_root/$USER
-# mkdir -p "$RAY_TMPDIR"
 ENGINE=${1:-vllm}
-# If you are using vllm<=0.6.3, you might need to set the following environment variable to avoid bugs:
-# export VLLM_ATTENTION_BACKEND=XFORMERS
-# python llava-cot.py 
-# python3 data/mathvista.py
-# python3 data/process.py
 export DEBUG_MODE=true
 
-
-# ⚠️ This makes all newly created files 666 -> 666, dirs 777 -> 777
-
-#chmod 777 -R outputs/
-#chmod 777 -R checkpoints/
 export WANDB_DIR="outputs/wandb/$USER/"
 system_prompt="You are a helpful assistant. When responding to any user query, first provide a clear, step-by-step thinking trace explaining your reasoning process. Then, output only the final answer enclosed <answer> </answer> tags. Please strictly follow the format."
 
@@ -70,7 +58,6 @@ experiment_name="$USER-mint-mathvista-$model-prompt-$prompt-adv_estimator-$adv_e
 
 
 export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader | tr '\n' ',' | sed 's/,$//')
-#export CUDA_VISIBLE_DEVICES=0,1
 export N_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | awk -F',' '{print NF}')
 echo "Using GPU" "$CUDA_VISIBLE_DEVICES"
 
