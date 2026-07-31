@@ -1,5 +1,6 @@
 import re
-from typing import Dict, Any, Union, List
+from collections import Counter
+from typing import Dict, Any, Union, List, Tuple
 
 
 class BaseEvaluator:
@@ -155,64 +156,139 @@ class TwentyFourPointsEvaluator(BaseEvaluator):
 
         return has_number and has_operator and brackets_match
 
-    def evaluate(self, output: str, ground_truth: Dict[str, Any], params: Dict[str, Any]) -> bool:
-        """
-        评估预测的答案是否正确
+    def evaluate(self, output: str, ground_truth: Any, params: Dict[str, Any] = None) -> Tuple[bool, str]:
+        """Evaluate a 24-point answer and return ``(is_correct, feedback)``.
 
-        参数:
-            predicted_answer: 模型预测的表达式
-            ground_truth: 包含正确答案和输入数字的字典
-            params: 其他参数
-
-        返回:
-            是否正确（布尔值）
+        The feedback is written to be *instructive* so it can be shown back to the
+        model as a learning signal: it diagnoses exactly what went wrong — which
+        numbers were mis-used, what the expression evaluated to, and in which
+        direction it missed 24 — so the model can self-correct on the next
+        attempt. It never reveals the reference solution.
         """
+        input_numbers = self._get_input_numbers(ground_truth, params)
+        nums_str = self._fmt_list(input_numbers) if input_numbers else "the given numbers"
+        goal_hint = (
+            f"Combine {nums_str}, using each number exactly once, with +, -, ×, ÷ and "
+            f"parentheses to make 24, and give the final expression in \\boxed{{}}."
+        )
+
         predicted_answer = self.extract_answer(output)
-        if not predicted_answer:
-            return False, "No valid expression could be extracted from the response"
+        expression = self._normalize_expression(predicted_answer) if predicted_answer else ""
 
-        # 清理和标准化表达式
-        expression = self._normalize_expression(predicted_answer)
+        # No usable arithmetic expression found: guide the model to the format.
+        if not expression or not re.search(r'[+\-*/]', expression):
+            return False, f"No arithmetic expression was found in your answer. {goal_hint}"
 
-        # 获取输入数字（从params的initial_state中获取）
-        input_numbers = params.get("numbers", [])
-        if not input_numbers and ground_truth:
-            input_numbers = ground_truth.get("initial_state", {}).get("numbers", [])
-
+        # If we somehow lack the puzzle's numbers, fall back to a plain value check.
         if not input_numbers:
-            return (
-                False,
-                "Missing input numbers",
-            )  # 如果无法获取输入数字，则认为答案不正确
+            try:
+                value = self._evaluate_expression(expression)
+            except Exception:
+                return False, f"Your expression could not be evaluated. {goal_hint}"
+            if abs(value - 24) < 1e-6:
+                return True, "Correct — your expression equals 24."
+            return False, f"Your expression equals {self._fmt(value)}, not 24. {goal_hint}"
 
         try:
-            # 检查是否使用了所有给定的数字，每个数字恰好使用一次
+            # 1) Each given number must be used exactly once (multiset comparison).
             used_numbers = self._extract_numbers(expression)
-            if sorted(used_numbers) != sorted(input_numbers):
-                feedback = f"Incorrect number usage: {used_numbers}, expected {input_numbers}"
-                if len(feedback) <= 100:
-                    return (
-                        False,
-                        feedback
-                    )  # 数字使用不正确
-                return False, "Incorrect number usage"
-            # 计算表达式的值，检查是否等于24
-            value = self._evaluate_expression(expression)
-            correct = abs(value - 24) < 1e-6  # 允许小数误差
-            feedback = f"Your solution = {value}"
-            if len(expression) > 100:
-                feedback = "Your solution"
-            if correct:
-                feedback += " = 24"
-            else:
-                feedback += " ≠ 24"
-            return correct, feedback
+            if Counter(used_numbers) != Counter(input_numbers):
+                usage = self._describe_number_usage(used_numbers, input_numbers)
+                return False, (
+                    f"Number-usage error: {usage} You must use each of {nums_str} "
+                    f"exactly once and use no other numbers."
+                )
 
+            # 2) The value must equal 24; otherwise report the gap and direction.
+            value = self._evaluate_expression(expression)
+            if abs(value - 24) < 1e-6:
+                return True, (
+                    f"Correct — your expression equals 24 using each of {nums_str} exactly once."
+                )
+
+            expr_echo = self._pretty_expression(expression)
+            expr_part = f" {expr_echo}" if len(expr_echo) <= 60 else ""
+            gap = 24 - value
+            if gap > 0:
+                direction = f"{self._fmt(gap)} short of 24 — make the result larger"
+            else:
+                direction = f"{self._fmt(-gap)} above 24 — make the result smaller"
+            return False, (
+                f"You used the right numbers, but your expression{expr_part} equals "
+                f"{self._fmt(value)}, which is {direction}."
+            )
+
+        except ZeroDivisionError:
+            return False, (
+                f"Your expression divides by zero. Rearrange it so that no division "
+                f"by zero occurs. {goal_hint}"
+            )
         except Exception:
-            # 如果解析或计算过程出错，视为不正确
-            if len(predicted_answer)<100:
-                return False, f"Failed to evaluate expression {predicted_answer}"
-            return False, "Failed to evaluate the expression"
+            hint = f" '{predicted_answer}'" if len(predicted_answer) <= 60 else ""
+            return False, (
+                f"Your expression{hint} could not be evaluated. Use only {nums_str} with "
+                f"+, -, ×, ÷ and balanced parentheses, and nothing else."
+            )
+
+    @staticmethod
+    def _fmt(n: Any) -> str:
+        """Render a number without a trailing '.0' when it is integral."""
+        try:
+            f = float(n)
+        except (TypeError, ValueError):
+            return str(n)
+        if abs(f - round(f)) < 1e-9:
+            return str(int(round(f)))
+        return f"{f:.4g}"
+
+    def _fmt_list(self, nums: List[Any]) -> str:
+        return "[" + ", ".join(self._fmt(n) for n in nums) + "]"
+
+    def _get_input_numbers(self, ground_truth: Any, params: Any) -> List:
+        """Best-effort extraction of the puzzle's numbers from either source.
+
+        For MM-HELIX 24Points, ``params`` is the parsed initial_state dict
+        ``{'numbers': [...]}`` and ``ground_truth`` is a reference expression
+        string. Stay robust to either being a dict, string, or None.
+        """
+        for src in (params, ground_truth):
+            if isinstance(src, dict):
+                if isinstance(src.get("numbers"), list):
+                    return list(src["numbers"])
+                inner = src.get("initial_state")
+                if isinstance(inner, dict) and isinstance(inner.get("numbers"), list):
+                    return list(inner["numbers"])
+        return []
+
+    def _describe_number_usage(self, used: List[int], expected: List[int]) -> str:
+        """Describe precisely how the used numbers differ from what is required."""
+        used_c = Counter(used)
+        exp_c = Counter(expected)
+        missing = exp_c - used_c   # needed more often than it was used
+        extra = used_c - exp_c     # used too often, or not allowed at all
+        msgs = []
+        for num in sorted(missing):
+            if used_c.get(num, 0) == 0:
+                msgs.append(f"you did not use {self._fmt(num)}")
+            else:
+                msgs.append(
+                    f"you used {self._fmt(num)} {used_c[num]}x but it should appear {exp_c[num]}x"
+                )
+        for num in sorted(extra):
+            if exp_c.get(num, 0) == 0:
+                msgs.append(f"you used {self._fmt(num)}, which is not one of the given numbers")
+            else:
+                msgs.append(
+                    f"you used {self._fmt(num)} {used_c[num]}x but only {exp_c[num]} is available"
+                )
+        if not msgs:
+            return "the set of numbers you used does not match the given numbers."
+        return "; ".join(msgs) + "."
+
+    @staticmethod
+    def _pretty_expression(expression: str) -> str:
+        """Convert a normalized expression back to human-friendly operators."""
+        return expression.replace('*', '×').replace('/', '÷')
 
     def _normalize_expression(self, expression: str) -> str:
         """标准化表达式，统一运算符符号"""
@@ -262,10 +338,24 @@ class TwentyFourPointsEvaluator(BaseEvaluator):
 
 if __name__ == "__main__":
     evaluator = TwentyFourPointsEvaluator()
-    params = {"numbers": [2, 5, 10, 12]}
-    answer = "(12 - 5) \\times 2 + 10"
-    print("\nModel output:")
-    print(answer)
-    is_correct, feedback = evaluator.evaluate(answer, {"initial_state": params}, params)
-    print("\nEvaluation result:")
-    print(f"Is correct: {is_correct}, Feedback: {feedback}")
+    numbers = [2, 5, 10, 12]
+    initial_state = {"numbers": numbers}
+    reference = "(12 - 5) × 2 + 10"  # ground_truth is a reference expression string
+
+    cases = [
+        ("(12 - 5) \\times 2 + 10", "correct → 24"),
+        ("(12 - 10) \\times 5 + 2", "right numbers, wrong value (too small)"),
+        ("12 \\times 5 - 10 - 2", "right numbers, wrong value (too big)"),
+        ("12 + 10 + 5", "missing a number (2)"),
+        ("2 \\times 2 \\times 5 \\times 12", "used 2 twice, missing 10"),
+        ("2 + 5 + 10 + 12 + 9", "used an extra number not given"),
+        ("I think the answer is probably 24", "no expression"),
+        ("5 \\div (12 - 10 - 2)", "division by zero"),
+    ]
+
+    for answer, label in cases:
+        is_correct, feedback = evaluator.evaluate(answer, reference, initial_state)
+        print(f"[{label}]")
+        print(f"  input   : {answer}")
+        print(f"  correct : {is_correct}")
+        print(f"  feedback: {feedback}\n")
